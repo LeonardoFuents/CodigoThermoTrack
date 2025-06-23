@@ -25,6 +25,7 @@ const int botaoTrava = 19;
 const int ledTrava = 5;
 const int ledDestrava = 18;
 
+bool estadoAlerta = false;
 bool estadoTrava = false; // false = destravado, true = travado
 bool ultimoEstadoBotao = HIGH;
 float axAnterior = 0, ayAnterior = 0, azAnterior = 0;
@@ -65,11 +66,42 @@ void processNMEA(String nmea);
 double convertToDecimalDegrees(String coordStr, String direction);
 double convertSINFCoordinate(String coordStr, bool isLatitude);
 
+void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+  Serial.print("Mensagem recebida no tópico: ");
+  Serial.println(topic);
+
+  // Imprime o payload recebido (opcional, para debug)
+  Serial.print("Payload: ");
+  for (unsigned int i = 0; i < length; i++)
+  {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+
+  // Desserializa diretamente do payload
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  if (error)
+  {
+    Serial.print("Erro ao fazer parse do JSON: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  if (!doc["alerta2"].isNull() && doc["alerta2"].as<bool>() == false)
+  {
+    Serial.println("Comando recebido: alerta2 = false. Desligando alerta local.");
+    estadoAlerta = false;
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
   conectaWiFi();
   setupGPS();
+  client.setCallback(mqttCallback);
   client.setServer(mqtt_server, mqtt_port);
   sim808.begin(9600, SERIAL_8N1, SIM808_RX_PIN, SIM808_TX_PIN);
   Wire.begin();
@@ -98,6 +130,7 @@ void loop()
   if (!client.connected())
   {
     mqttConnect();
+    client.subscribe(TOPICO_SENSORES);
   }
   client.loop();
 
@@ -112,14 +145,12 @@ void loop()
     }
   }
 
-  // A cada 3 segundos, solicitar dados GPS
   if (millis() - lastGPSRequest > 3000)
   {
     lastGPSRequest = millis();
     requestGPSData();
   }
 
-  // A cada 15 segundos, verificar status do GPS
   if (millis() - lastStatusCheck > 15000)
   {
     lastStatusCheck = millis();
@@ -157,13 +188,18 @@ void loop()
     ayAnterior = ay;
     azAnterior = az;
 
+    if (estadoTrava && movimentoDetectado)
+    {
+      estadoAlerta = true;
+    }
+
     StaticJsonDocument<192> doc;
     doc["latitude"] = ultimaLatitude;
     doc["longitude"] = ultimaLongitude;
     doc["movimento"] = movimentoDetectado;
     doc["trava"] = estadoTrava;
     doc["temperatura"] = temperatura;
-    doc["alerta"] = (estadoTrava && movimentoDetectado);
+    doc["alerta"] = estadoAlerta;
 
     char mensagem[192];
     serializeJson(doc, mensagem);
@@ -196,17 +232,13 @@ void setupGPS()
 {
   Serial.println("Configurando módulo GPS...");
 
-  // Verificar se o módulo responde
   sendATCommand("AT", 500);
 
-  // Ligar o GPS
   Serial.println("Ligando GPS...");
   sendATCommand("AT+CGPSPWR=1", 2000);
 
-  // Configurar modo GPS standalone
   sendATCommand("AT+CGPSMODE=1", 1000);
 
-  // Reset cold start
   sendATCommand("AT+CGPSRST=0", 2000);
 
   gpsInitialized = true;
@@ -215,7 +247,6 @@ void setupGPS()
 
 void requestGPSData()
 {
-  // Solicitar informações GPS no formato SINF
   sim808.println("AT+CGPSINF=0");
   delay(100);
 }
@@ -235,7 +266,6 @@ void sendATCommand(const char *command, int delayTime)
   sim808.println(command);
   delay(delayTime);
 
-  // Ler resposta
   unsigned long timeout = millis() + (delayTime + 500);
   while (millis() < timeout && sim808.available())
   {
@@ -250,19 +280,16 @@ void sendATCommand(const char *command, int delayTime)
 
 void processResponse(String response)
 {
-  // Debug: mostrar respostas não-NMEA
   if (!response.startsWith("$G") && !response.startsWith("+CGPSINF"))
   {
     Serial.println("SIM808: " + response);
   }
 
-  // Processar dados SINF (resposta do AT+CGPSINF=0)
   if (response.startsWith("+CGPSINF:") || response.startsWith("SINF:"))
   {
     processSINF(response);
   }
 
-  // Processar dados NMEA tradicionais
   else if (response.startsWith("$GPRMC") || response.startsWith("$GPGGA") ||
            response.startsWith("$GPGSV") || response.startsWith("$GPGSA"))
   {
@@ -274,10 +301,6 @@ void processSINF(String sinfData)
 {
   Serial.println("DADOS SINF: " + sinfData);
 
-  // Formato SINF: 0,latitude,longitude,altitude,data_hora,fix,satelites,velocidade,curso
-  // Exemplo: SINF: 0,2336.925300,4634.237600,760.600000,20250610122555.000,0,12,1.055640,24.139999
-
-  // Remover prefixo se presente
   String data = sinfData;
   if (data.startsWith("+CGPSINF: "))
   {
@@ -288,7 +311,6 @@ void processSINF(String sinfData)
     data = data.substring(6);
   }
 
-  // Separar os campos por vírgula
   String fields[10];
   int fieldIndex = 0;
   int startIndex = 0;
@@ -305,15 +327,14 @@ void processSINF(String sinfData)
 
   if (fieldIndex >= 7)
   {
-    String status = fields[0];   // 0 = sem fix, outros = com fix
-    String latStr = fields[1];   // Latitude DDMM.MMMMMM
-    String lonStr = fields[2];   // Longitude DDDMM.MMMMMM
-    String altStr = fields[3];   // Altitude
-    String dateTime = fields[4]; // Data/hora
-    String fixType = fields[5];  // Tipo de fix
-    String satStr = fields[6];   // Número de satélites
+    String status = fields[0];
+    String latStr = fields[1];
+    String lonStr = fields[2];
+    String altStr = fields[3];
+    String dateTime = fields[4];
+    String fixType = fields[5];
+    String satStr = fields[6];
 
-    // Atualizar contagem de satélites
     satelliteCount = satStr.toInt();
 
     Serial.println("\n=== DADOS GPS PROCESSADOS ===");
@@ -322,25 +343,20 @@ void processSINF(String sinfData)
     Serial.println("Lat bruta: " + latStr);
     Serial.println("Lon bruta: " + lonStr);
 
-    // Verificar se temos coordenadas válidas
     if (latStr.length() > 4 && lonStr.length() > 4 &&
         latStr.toDouble() != 0.0 && lonStr.toDouble() != 0.0)
     {
 
-      // Converter coordenadas para formato decimal
-      ultimaLatitude = convertSINFCoordinate(latStr, true);   // true = latitude
-      ultimaLongitude = convertSINFCoordinate(lonStr, false); // false = longitude
+      ultimaLatitude = convertSINFCoordinate(latStr, true);
+      ultimaLongitude = convertSINFCoordinate(lonStr, false);
 
-      // CORREÇÃO IMPORTANTE: Para Brasil, coordenadas devem ser negativas
-      // Latitude Sul (Brasil está no hemisfério Sul)
       if (ultimaLatitude > 0 && ultimaLatitude < 60)
-      { // Assumindo Brasil/América do Sul
+      {
         ultimaLatitude = -ultimaLatitude;
       }
 
-      // Longitude Oeste (Brasil está no hemisfério Oeste)
       if (ultimaLongitude > 0 && ultimaLongitude < 180)
-      { // Assumindo Brasil/América
+      {
         ultimaLongitude = -ultimaLongitude;
       }
 
@@ -355,7 +371,6 @@ void processSINF(String sinfData)
 
       Serial.printf("Satélites: %d\n", satelliteCount);
 
-      // Processar data/hora se disponível
       if (dateTime.length() >= 14)
       {
         String date = dateTime.substring(0, 8);
@@ -392,23 +407,18 @@ double convertSINFCoordinate(String coordStr, bool isLatitude)
   if (rawCoord == 0.0)
     return 0.0;
 
-  // Para SINF, as coordenadas já vêm no formato correto DDMM.MMMMMM
-  // Precisamos converter para graus decimais
   double degrees = floor(rawCoord / 100.0);
   double minutes = rawCoord - (degrees * 100.0);
   double decimalDegrees = degrees + (minutes / 60.0);
 
-  // Para o formato SINF, coordenadas Sul e Oeste são negativas
-  // Mas geralmente já vêm com o sinal correto
   return decimalDegrees;
 }
 
 void processNMEA(String nmea)
 {
-  // Manter processamento NMEA para compatibilidade
+
   if (nmea.startsWith("$GPGSV"))
   {
-    // Extrair número de satélites do NMEA se SINF não estiver disponível
     int firstComma = nmea.indexOf(',');
     int secondComma = nmea.indexOf(',', firstComma + 1);
     int thirdComma = nmea.indexOf(',', secondComma + 1);
@@ -428,7 +438,7 @@ void processNMEA(String nmea)
 
 double convertToDecimalDegrees(String coordStr, String direction)
 {
-  // Função mantida para compatibilidade com NMEA
+
   if (coordStr.length() == 0)
     return 0.0;
 
